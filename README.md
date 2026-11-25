@@ -4,9 +4,11 @@
 
 ## 下载
 
-[ColorOS 17.0.0.101 V1 · 刷机包和发布说明](https://github.com/Chell64/cpday11-coloros17/releases/tag/17.0.0.101-v1)
+[进入 GitHub Releases 下载刷机包](https://github.com/Chell64/cpday11-coloros17/releases)
 
-把全部 7z 分卷放在同一目录，从 `.7z.001` 解压。安装步骤和校验方式见发行页和包内 README。
+选定版本后，在对应发行页下载全部 7z 分卷和 SHA-256 校验清单。把分卷放在同一目录，从 `.7z.001` 解压。
+
+V1 解压后的目录为 `CPDAY11-ColorOS17-17.0.0.101-V1-fastboot-windows-x64`。打开目录中的 `Flash.cmd` 即可开始，详细步骤见包内 README。
 
 ## 刷入前
 
