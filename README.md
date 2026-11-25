@@ -1,14 +1,18 @@
 ![酷派 COOL X Wide（CPDAY11）与 ColorOS 17 标识](assets/cool-x-wide-coloros17.png)
 
-面向酷派阔直板 **COOL X Wide（CPDAY11）** 的非官方 ColorOS 17 移植。以国行 Reno16 为底包，适配 OPPO Pad 5 Pro 的全景虚拟屏。
+面向酷派阔直板 COOL X Wide（CPDAY11） 的非官方 ColorOS 17 移植。并加入了诸多改善体验的兼容功能。
 
 ## 下载
 
-[进入 GitHub Releases 下载刷机包](https://github.com/Chell64/cpday11-coloros17/releases)
+[Releases 下载](https://github.com/Chell64/cpday11-coloros17/releases)
 
-选定版本后，在对应发行页下载全部 7z 分卷和 SHA-256 校验清单。把分卷放在同一目录，从 `.7z.001` 解压。
+下载全部 7z 分卷和 SHA-256 校验清单。把分卷放在同一目录，从 `.7z.001` 解压。
 
-V1 解压后的目录为 `CPDAY11-ColorOS17-17.0.0.101-V1-fastboot-windows-x64`。打开目录中的 `Flash.cmd` 即可开始，详细步骤见包内 README。
+解压后，您应该得到：
+
+CPDAY11-ColorOS17-17.0.0.xxx-xx-fastboot-windows-x64
+
+打开目录中的 `Flash.cmd` 即可开始，详细步骤见包内 README。
 
 ## 刷入前
 
