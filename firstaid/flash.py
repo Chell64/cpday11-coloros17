@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import socket
 import struct
 import subprocess
 import sys
@@ -33,8 +34,9 @@ AB_PHYSICAL = (*STOCK_SLOT_FIRMWARE_MIB, "boot_a", "init_boot_a", "dtbo_a", *PHY
 AB_PARTITIONS = AB_LOGICAL + AB_PHYSICAL
 SERIAL = re.compile(r"[A-Za-z0-9]+")
 LK_VERSION = "k6789v1_64_79ec5a07814_202611040746"
+LK_VERSION_PREFIX = "k6789v1_64_"
 MIB = 1024 * 1024
-MODE_NAMES = {"fastboot": "fastbootd", "recovery": "Recovery"}
+MODE_NAMES = {"fastboot": "fastbootd", "recovery": "Recovery", "bootloader": "引导器 fastboot（LK）"}
 
 
 class FlashError(Exception):
@@ -80,6 +82,17 @@ class NativeFastboot:
         if not match:
             raise FlashError(f"缺少 getvar {name} 的响应。{output.strip()}")
         return match[1].strip()
+
+    def logical_status(self, name):
+        try:
+            return self.get(f"is-logical:{name}")
+        except FlashError as error:
+            if re.search(r"\bFAILED\s*\(remote: 'Partition not found'\)", str(error)):
+                return "missing"
+            raise
+
+    def rebuild_super(self, image, root):
+        print(self.command("wipe-super", str(image.relative_to(root)), timeout=180), flush=True)
 
     def flash(self, name, image):
         relative = Path("images") / image.name
@@ -166,18 +179,40 @@ class UsbFastboot:
 
 
 class Transport:
-    def __init__(self, root):
+    reconnect_timeout = 100
+
+    def __init__(self, root, tools=None):
         self.root = root
-        self.tools = root / "tools" / "platform-tools"
-        libusb = root / "tools" / "python" / "libusb-1.0.dll"
+        tools = tools if tools is not None else root / "tools"
+        self.tools = tools / "platform-tools"
+        libusb = tools / "python" / "libusb-1.0.dll"
         self.backend = usb.backend.libusb1.get_backend(find_library=lambda _: str(libusb))
         if self.backend is None:
             raise FlashError("无法加载包内 libusb。")
         self.env = {**os.environ, "ADB_LIBUSB": "1"}
         self.serial = None
+        self.adb_socket = None
+        self.adb_used = False
+
+    @contextmanager
+    def isolated_adb(self):
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            self.adb_socket = f"tcp:localhost:{listener.getsockname()[1]}"
+        try:
+            yield
+        finally:
+            if self.adb_used:
+                with suppress(FlashError, OSError, subprocess.TimeoutExpired):
+                    self.run("adb", "kill-server", timeout=5)
+            self.adb_socket = None
+            self.adb_used = False
 
     def run(self, program, *args, timeout=10):
         command = [str(self.tools / f"{program}.exe")]
+        if program == "adb" and self.adb_socket:
+            self.adb_used = True
+            command.extend(["-L", self.adb_socket])
         completed = subprocess.run(command + list(args), stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, encoding="utf-8", errors="replace",
                                    check=False, timeout=timeout, env=self.env, cwd=self.root)
@@ -237,9 +272,16 @@ class Transport:
 
     @contextmanager
     def connect(self, mode=None, *, recovery=False):
-        deadline = time.monotonic() + 100
+        deadline = None if self.reconnect_timeout is None else time.monotonic() + self.reconnect_timeout
+        if deadline is None:
+            instructions = {
+                "LK": "若手机仍停在 Recovery 或 fastbootd，请手动进入引导器 fastboot，脚本会继续。",
+                "fastbootd": "若手机仍停在引导器，请在设备上选择进入 fastbootd，脚本会继续。",
+            }
+            print(f"正在等待 {mode or '引导器 fastboot / fastbootd'} 连接。"
+                  f"{instructions.get(mode, '请连接设备并进入 fastboot 或 fastbootd。')}可按 Ctrl+C 退出等待。", flush=True)
         last_error = ""
-        while time.monotonic() < deadline:
+        while deadline is None or time.monotonic() < deadline:
             try:
                 serials = self.native_serials()
                 lk = list(self.lk_interfaces())
@@ -277,21 +319,28 @@ class Transport:
                         raise
                     last_error = str(error)
             if recovery:
-                adb_devices = self.run("adb", "devices")
+                try:
+                    adb_devices = self.run("adb", "devices")
+                except (FlashError, subprocess.TimeoutExpired) as error:
+                    last_error = str(error)
+                    time.sleep(1)
+                    continue
                 recovered = [fields[0] for line in adb_devices.splitlines()
                              if len(fields := line.split()) == 2 and fields[1] == "recovery"]
                 if len(recovered) > 1:
                     raise FlashError("检测到多台 Recovery 设备。")
                 if recovered:
                     self.check_serial(recovered[0])
-                    recovery = False
                     try:
                         self.run("adb", "-s", self.serial, "reboot", "bootloader", timeout=15)
-                    except subprocess.TimeoutExpired as error:
+                        recovery = False
+                    except (FlashError, subprocess.TimeoutExpired) as error:
                         last_error = str(error)
             time.sleep(1)
         hint = ("若手机停在 Recovery，请在手机上选择进入 fastbootd，并检查 Windows 的 fastbootd 接口驱动。"
                 if mode == "fastbootd" else "请核对当前模式、数据线和 WinUSB 驱动。")
+        if mode == "LK" and recovery:
+            hint += "如果 Recovery 一直未被识别，请关闭手机助手或其他占用 ADB 的程序，再从手机进入引导器 fastboot。"
         raise FlashError(f"等待 {mode or 'fastboot / fastbootd'} 超时。{hint}\n{last_error}")
 
 
@@ -307,24 +356,33 @@ def hexadecimal_getvar(connection, name):
         raise FlashError(f"getvar {name} 返回无效的十六进制值 {value!r}。") from error
 
 
-def validate(connection, mode, serial, images, *, active="a", target="a", complete=False, verified_firmware=()):
+def validate(connection, mode, serial, images, *, active="a", target="a", complete=False,
+             verified_firmware=(), check_logical=True):
     common = {"serialno": serial, "unlocked": "yes", "current-slot": active}
     if mode == "fastbootd":
         expected = {**common, "is-userspace": "yes", "product": "L950U", "snapshot-update-status": "none"}
     else:
-        expected = {**common, "is-userspace": "no", "product": "k6789v1_64", "version-bootloader": LK_VERSION}
+        expected = {**common, "is-userspace": "no", "product": "k6789v1_64"}
     for name, value in expected.items():
         actual = connection.get(name)
         if actual != value:
             raise FlashError(f"{mode} 设备检查失败。{name} 为 {actual}，需要 {value}。")
+    if mode == "LK":
+        # Only the complete slot package can replace LK and the other board firmware.
+        version = connection.get("version-bootloader")
+        if complete and version != LK_VERSION:
+            raise FlashError(f"LK 设备检查失败。version-bootloader 为 {version}，需要 {LK_VERSION}。")
+        if not complete and not version.startswith(LK_VERSION_PREFIX):
+            raise FlashError(f"LK 设备检查失败。version-bootloader 为 {version}，需要以 {LK_VERSION_PREFIX} 开头。")
     max_download = hexadecimal_getvar(connection, "max-download-size")
     if mode == "fastbootd":
         if max_download < 112 * MIB:
             raise FlashError("fastbootd 下载容量小于 112 MiB。")
-        for source in AB_LOGICAL if complete else LOGICAL:
-            name = for_slot(source, target)
-            if connection.get(f"is-logical:{name}") != "yes":
-                raise FlashError(f"未找到预期的逻辑分区 {name}。")
+        if check_logical:
+            for source in AB_LOGICAL if complete else LOGICAL:
+                name = for_slot(source, target)
+                if connection.get(f"is-logical:{name}") != "yes":
+                    raise FlashError(f"未找到预期的逻辑分区 {name}。")
         for name in ("userdata", "metadata"):
             if partition_size(connection, name) <= 0:
                 raise FlashError(f"缺少有效的 {name} 分区。")
@@ -516,7 +574,18 @@ def install_inactive(transport, images, *, probe=False, confirm_release=None, fi
     print(f"已切换到 {target.upper()} 槽并发送重启命令。{suffix}", flush=True)
 
 
-def main():
+def confirm_flash(keep_data):
+    print("若使用此自制固件，此手机的保修可能会失效。", flush=True)
+    print("本次从同一构建平刷并保留用户数据。" if keep_data
+          else "刷入完成后将清除手机上的全部用户数据。请先备份。", flush=True)
+    print("双槽包如遇空间不足，会先请你确认释放旧槽分区。", flush=True)
+    try:
+        return input("确认要刷入吗？输入 yes 确认，输入其它内容则取消刷入。 ") == "yes"
+    except EOFError:
+        return False
+
+
+def main(argv=None, *, firmware=None, tools=None, confirm=None, create_transport=None):
     parser = argparse.ArgumentParser(description=__doc__)
     checks = parser.add_mutually_exclusive_group()
     checks.add_argument("--check", action="store_true", help="仅校验包内文件")
@@ -524,24 +593,21 @@ def main():
     parser.add_argument("--verified-slot-firmware", "--verified-b-firmware", type=Path,
                         help="本机目标槽已写入的原厂固件读回记录")
     parser.add_argument("--keep-data", action="store_true", help="从已启动的同一构建执行双槽平刷，保留数据")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    root = firmware if firmware is not None else ROOT
     try:
-        if not (args.check or args.probe):
-            print("若使用此自制固件，此手机的保修可能会失效。", flush=True)
-            print("本次从同一构建平刷并保留用户数据。" if args.keep_data
-                  else "刷入完成后将清除手机上的全部用户数据。请先备份。", flush=True)
-            print("双槽包如遇空间不足，会先请你确认释放旧槽分区。", flush=True)
-            try:
-                answer = input("确认要刷入吗？输入 yes 确认，输入其它内容则取消刷入。 ")
-            except EOFError:
-                answer = ""
-            if answer != "yes":
-                print("已取消刷入。", flush=True)
-                return 0
-        images = verified_images(ROOT)
+        if not (args.check or args.probe) and not (confirm or confirm_flash)(args.keep_data):
+            print("已取消刷入。", flush=True)
+            return 0
+        images = verified_images(root)
+        if firmware is not None and images.keys() != set(AB_PARTITIONS):
+            raise FlashError("此工具需要完整的 CPDAY11 A/B 固件包。")
         if args.check:
             return 0
-        transport = Transport(ROOT)
+        if create_transport is not None and not args.probe:
+            transport = create_transport(root, tools)
+        else:
+            transport = Transport(root) if tools is None else Transport(root, tools)
         install_args = {"probe": args.probe}
         if args.verified_slot_firmware is not None:
             install_args["firmware_receipt"] = args.verified_slot_firmware
