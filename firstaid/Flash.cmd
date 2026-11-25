@@ -23,14 +23,23 @@ HERE = Path(__file__).resolve()
 ROOT = HERE.parent if HERE.suffix.lower() == ".cmd" else HERE.parents[2]
 sys.path.insert(0, str(ROOT / "tools" / "python"))
 
-from flash import (AB_LOGICAL, LOGICAL, MIB, PHYSICAL, FlashError, Transport, confirm_space_release,
-                   for_slot, hexadecimal_getvar, partition_size, validate)
+from flash import (AB_LOGICAL, LOGICAL, MIB, PARTITIONS as COLOROS_PARTITIONS, PHYSICAL, FlashError,
+                   Transport, confirm_space_release, for_slot, hexadecimal_getvar, partition_size,
+                   validate, verified_images as verified_coloros_images)
 
 
 BOOT = ("boot_a", "init_boot_a", "dtbo_a") + PHYSICAL
 PARTITIONS = AB_LOGICAL + BOOT
 B_REFERENCE = "stock-b-firmware.sha256"
 B_RECEIPT = "verified-b-firmware.json"
+COLOROS_V1_BOOT_DIGEST = "975c2709d403979f194476066a666cc6107e7b4176cdf137124e755308a2a445"
+COLOROS_V1_SUPPORT = {
+    "boot_a": "39e1c9935f3adc3782449eb1285a67974094210cfbc3f79bbab7e6566f62236d",
+    "init_boot_a": "5881e0cb446d86a45de15653d55cfdf9b11b138d0a6e8385a4c9dafa53514119",
+    "dtbo_a": "947bc476377255415cf72a4997976d82b11feb3cb977cb2e6d837640e8d4d8e7",
+    "odm_dlkm_a": "8f8f0f28acd845c65bd27822485ac5428a59dadd88325af1194d9cf3cff5e646",
+    "system_dlkm_a": "2d5f9aa335d643c0b03f036e1e6f9a364ecbc50ee41a50796cedd3897f6f0227",
+}
 
 
 def sha256(path):
@@ -53,6 +62,23 @@ def verified_images(root):
     if checked != expected:
         raise FlashError("原厂回退包的校验清单不完整。")
     return {name: root / "images" / f"{name}.img" for name in PARTITIONS}
+
+
+def verified_coloros_v1(root):
+    if (root / "expected-boot-digest.txt").read_text(encoding="ascii").strip() != COLOROS_V1_BOOT_DIGEST:
+        raise FlashError("双槽补丁适用于 ColorOS 17.0.0.101 V1。")
+    images = verified_coloros_images(root)
+    if images.keys() != set(COLOROS_PARTITIONS):
+        raise FlashError("未识别 ColorOS V1 原始镜像清单。")
+    for name, expected in COLOROS_V1_SUPPORT.items():
+        image = root / "images" / f"{name}.img"
+        if not image.is_file():
+            raise FlashError(f"缺少 {image.name}。请将双槽补丁完整复制到 ColorOS V1 解压目录。")
+        if sha256(image) != expected:
+            raise FlashError(f"SHA-256 校验失败。{image.name}")
+        print(f"SHA-256 OK  images/{image.name}", flush=True)
+        images[name] = image
+    return images
 
 
 def choose_target(root, serial, active, requested):
@@ -86,7 +112,7 @@ def check_transport(conn, mode, serial, images, active, target):
             raise FlashError(f"原厂启动镜像与 {name} 的容量或下载限制不符。")
 
 
-def plan_partitions(conn, images, active, target):
+def plan_partitions(conn, images, target):
     other = "b" if target == "a" else "a"
     super_size = partition_size(conn, "super")
     if super_size != 9 * 1024**3:
@@ -103,36 +129,40 @@ def plan_partitions(conn, images, active, target):
     needed = sum(map(aligned, desired.values()))
     available = super_size - MIB - sum(map(aligned, occupied.values()))
     release = []
-    if active != target:
-        for source in ("product_a", "system_ext_a", "system_a"):
-            name = for_slot(source, active)
-            if available >= needed:
-                break
-            if occupied[name]:
-                release.append(name)
-                available += aligned(occupied[name])
+    for source in ("product_a", "system_ext_a", "system_a"):
+        name = for_slot(source, other)
+        if available >= needed:
+            break
+        if occupied[name]:
+            release.append(name)
+            available += aligned(occupied[name])
     if available < needed:
         raise FlashError(f"目标槽最多可使用 {max(0, available):,} 字节，原厂镜像需要 {needed:,} 字节。")
     shrink = [(name, size) for name, size in desired.items() if partition_size(conn, name) > size]
     return release, shrink
 
 
-def install(transport, root, images, *, requested="auto", probe=False, confirm_release=confirm_space_release):
+def install(transport, root, images, *, requested="auto", probe=False, coloros=False,
+            confirm_release=confirm_space_release):
+    if coloros and requested == "b":
+        raise FlashError("ColorOS V1 双槽补丁以 A 槽为安装目标。请使用默认选项或 --slot a。")
     with transport.connect() as (mode, conn):
         active = conn.get("current-slot")
         if active not in {"a", "b"}:
             raise FlashError("无法读取当前活动槽。")
-        target = choose_target(root, transport.serial, active, requested)
-        print(f"当前槽 {active.upper()}，原厂恢复目标为 {target.upper()} 槽。", flush=True)
+        target = "a" if coloros else choose_target(root, transport.serial, active, requested)
+        label = "ColorOS V1" if coloros else "酷派原厂系统"
+        print(f"当前槽 {active.upper()}，{label} 将写入 {target.upper()} 槽。", flush=True)
         check_transport(conn, mode, transport.serial, images, active, target)
         if mode == "LK":
             conn.reboot("fastboot")
 
     with transport.connect("fastbootd") as (mode, conn):
         check_transport(conn, mode, transport.serial, images, active, target)
-        release, shrink = plan_partitions(conn, images, active, target)
-        if release and not probe and not confirm_release(active, target, release):
-            print("已取消恢复。", flush=True)
+        release, shrink = plan_partitions(conn, images, target)
+        other = "b" if target == "a" else "a"
+        if release and not probe and not confirm_release(other, target, release):
+            print("已取消刷入。", flush=True)
             return
         conn.reboot("recovery")
 
@@ -145,7 +175,7 @@ def install(transport, root, images, *, requested="auto", probe=False, confirm_r
 
     with transport.connect("fastbootd") as (mode, conn):
         check_transport(conn, mode, transport.serial, images, active, target)
-        if plan_partitions(conn, images, active, target) != (release, shrink):
+        if plan_partitions(conn, images, target) != (release, shrink):
             raise FlashError("分区容量计划发生变化，请重新开始恢复。")
         if probe:
             print("引导器与 fastbootd 预检通过，未刷写分区。", flush=True)
@@ -160,14 +190,14 @@ def install(transport, root, images, *, requested="auto", probe=False, confirm_r
             target_name = for_slot(name, target)
             conn.flash(target_name, images[name])
             if partition_size(conn, target_name) != images[name].stat().st_size:
-                raise FlashError(f"{target_name} 刷入后的容量与原厂镜像不符。")
+                raise FlashError(f"{target_name} 刷入后的容量与镜像不符。")
         conn.erase("userdata")
         conn.erase("metadata")
         conn.set_active(target)
         if conn.get("current-slot") != target:
             raise FlashError(f"未收到 {target.upper()} 槽激活确认。")
         conn.reboot()
-    print(f"原厂系统已写入 {target.upper()} 槽，用户数据已清除。请等待酷派首次设置。", flush=True)
+    print(f"{label} 已写入 {target.upper()} 槽，用户数据已清除。请等待首次设置。", flush=True)
 
 
 def main():
@@ -175,24 +205,27 @@ def main():
     checks = parser.add_mutually_exclusive_group()
     checks.add_argument("--check", action="store_true", help="仅核对镜像")
     checks.add_argument("--probe", action="store_true", help="只读检查刷机通道及槽位")
-    parser.add_argument("--slot", choices=("auto", "a", "b"), default="auto", help="原厂回退目标槽")
+    parser.add_argument("--slot", choices=("auto", "a", "b"), default="auto", help="安装目标槽")
     args = parser.parse_args()
     try:
+        coloros = (ROOT / "extras" / "Gleaner.apk").is_file()
         if not (args.check or args.probe):
-            print("恢复酷派原厂系统会清除全部用户数据，包括照片、应用和 USB 调试授权。请先备份。")
-            if input("确认要恢复原厂吗？输入 yes 确认，输入其它内容则取消。 ") != "yes":
-                print("已取消恢复。")
+            if coloros:
+                print("若使用此自制固件，此手机的保修可能会失效。")
+            print("刷入会清除全部用户数据，包括照片、应用和 USB 调试授权。请先备份。")
+            if input("确认要刷入吗？输入 yes 确认，输入其它内容则取消。 ") != "yes":
+                print("已取消刷入。")
                 return 0
-        images = verified_images(ROOT)
+        images = verified_coloros_v1(ROOT) if coloros else verified_images(ROOT)
         if not args.check:
-            install(Transport(ROOT), ROOT, images, requested=args.slot, probe=args.probe)
+            install(Transport(ROOT), ROOT, images, requested=args.slot, probe=args.probe, coloros=coloros)
         return 0
     except EOFError:
-        print("已取消恢复。")
+        print("已取消刷入。")
         return 0
     except (FlashError, OSError, ValueError, subprocess.TimeoutExpired, KeyboardInterrupt) as error:
-        print(f"恢复流程已停止。{error}", file=sys.stderr, flush=True)
-        print("请保留当前界面。排除问题后，从 fastboot 或 fastbootd 重新运行同一回退包。",
+        print(f"刷入流程已停止。{error}", file=sys.stderr, flush=True)
+        print("请保留当前界面。排除问题后，从 fastboot 或 fastbootd 重新运行同一刷机包。",
               file=sys.stderr, flush=True)
         return 1
 

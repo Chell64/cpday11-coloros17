@@ -3,6 +3,7 @@
 import argparse
 from contextlib import contextmanager, suppress
 from hashlib import file_digest
+import json
 import os
 from pathlib import Path
 import re
@@ -189,6 +190,21 @@ class Transport:
         return {fields[0] for line in results.splitlines()
                 if len(fields := line.split()) == 2 and fields[1] == "fastboot"}
 
+    def enter_fastbootd_for_keep_data(self):
+        devices = [line.split() for line in self.run("adb", "devices").splitlines()[1:] if line.strip()]
+        if len(devices) != 1 or len(devices[0]) != 2 or devices[0][1] != "device":
+            raise FlashError("保留数据刷入需要从已授权 USB 调试的当前系统开始，并且只连接一台设备。")
+        self.check_serial(devices[0][0])
+        expected = (self.root / "expected-boot-digest.txt").read_text(encoding="ascii").strip()
+        fields = self.run("adb", "-s", self.serial, "shell",
+                          "getprop ro.boot.slot_suffix; getprop ro.boot.vbmeta.digest; "
+                          "getprop sys.boot_completed").splitlines()
+        if (not re.fullmatch(r"[0-9a-f]{64}", expected) or len(fields) != 3
+                or fields[0] not in {"_a", "_b"} or fields[1:] != [expected, "1"]):
+            raise FlashError("保留数据刷入要求手机已从与刷机包相同的 AVB 启动链完整进入 Android。")
+        self.run("adb", "-s", self.serial, "reboot", "fastboot", timeout=15)
+        return fields[0][1:]
+
     def lk_interfaces(self):
         for device in usb.core.find(find_all=True, backend=self.backend, idVendor=0x0E8D, idProduct=0x201C):
             for config in device:
@@ -291,7 +307,7 @@ def hexadecimal_getvar(connection, name):
         raise FlashError(f"getvar {name} 返回无效的十六进制值 {value!r}。") from error
 
 
-def validate(connection, mode, serial, images, *, active="a", target="a", complete=False):
+def validate(connection, mode, serial, images, *, active="a", target="a", complete=False, verified_firmware=()):
     common = {"serialno": serial, "unlocked": "yes", "current-slot": active}
     if mode == "fastbootd":
         expected = {**common, "is-userspace": "yes", "product": "L950U", "snapshot-update-status": "none"}
@@ -314,6 +330,8 @@ def validate(connection, mode, serial, images, *, active="a", target="a", comple
                 raise FlashError(f"缺少有效的 {name} 分区。")
     else:
         for source in AB_PHYSICAL if complete else PHYSICAL:
+            if source in verified_firmware:
+                continue
             name = for_slot(source, target)
             expected_size = STOCK_SLOT_FIRMWARE_MIB.get(
                 source, 64 if source in {"boot_a", "vendor_boot_a"} else 8) * MIB
@@ -333,9 +351,14 @@ def validate(connection, mode, serial, images, *, active="a", target="a", comple
                     raise FlashError(f"{name} 稀疏镜像展开后与原厂分区大小不符。")
 
 
-def install(transport, images, *, probe=False, confirm_release=None):
+def install(transport, images, *, probe=False, confirm_release=None, firmware_receipt=None, keep_data=False):
     if images.keys() == set(AB_PARTITIONS):
-        return install_inactive(transport, images, probe=probe, confirm_release=confirm_release)
+        return install_inactive(transport, images, probe=probe, confirm_release=confirm_release,
+                                firmware_receipt=firmware_receipt, keep_data=keep_data)
+    if keep_data:
+        raise FlashError("只有完整双槽包支持保留数据刷入。")
+    if firmware_receipt is not None:
+        raise FlashError("只有完整双槽包支持固件读回记录。")
     print("检查 fastboot 和 fastbootd 通道。", flush=True)
     with transport.connect() as (start, conn):
         validate(conn, start, transport.serial, images)
@@ -409,13 +432,36 @@ def confirm_space_release(active, target, release):
         return False
 
 
-def install_inactive(transport, images, *, probe=False, confirm_release=None):
+def checked_slot_firmware(receipt_path, images, serial, active, target):
+    if receipt_path is None:
+        return ()
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    if not isinstance(receipt, dict) or (receipt.get("serial"), receipt.get("active"), receipt.get("target")) != (
+            serial, active, target):
+        raise FlashError("固件读回记录与当前设备或槽位不符。")
+    digests = receipt.get("package_firmware_sha256")
+    if not isinstance(digests, dict) or digests.keys() != STOCK_SLOT_FIRMWARE_MIB.keys():
+        raise FlashError("读回记录缺少原厂固件。")
+    for name, expected in digests.items():
+        with images[name].open("rb") as stream:
+            if file_digest(stream, "sha256").hexdigest() != expected:
+                raise FlashError(f"读回记录与刷机包的 {name}.img 不符。")
+    print(f"使用本机 {target.upper()} 槽固件读回记录，跳过 {len(digests)} 个已校验的原厂固件分区。", flush=True)
+    return STOCK_SLOT_FIRMWARE_MIB.keys()
+
+
+def install_inactive(transport, images, *, probe=False, confirm_release=None, firmware_receipt=None,
+                     keep_data=False):
+    source_slot = transport.enter_fastbootd_for_keep_data() if keep_data else None
     with transport.connect() as (start, conn):
         active = conn.get("current-slot")
         if active not in {"a", "b"}:
             raise FlashError(f"无法识别当前槽位。{active}")
+        if keep_data and active != source_slot:
+            raise FlashError("fastboot 当前槽与已校验的 Android 槽位不符。")
         target = "b" if active == "a" else "a"
-        slot_args = dict(active=active, target=target, complete=True)
+        verified_firmware = checked_slot_firmware(firmware_receipt, images, transport.serial, active, target)
+        slot_args = dict(active=active, target=target, complete=True, verified_firmware=verified_firmware)
         validate(conn, start, transport.serial, images, **slot_args)
         if start == "LK":
             conn.reboot("fastboot")
@@ -434,7 +480,8 @@ def install_inactive(transport, images, *, probe=False, confirm_release=None):
         validate(conn, mode, transport.serial, images, **slot_args)
         if not probe:
             for source in AB_PHYSICAL:
-                conn.flash(for_slot(source, target), images[source])
+                if source not in verified_firmware:
+                    conn.flash(for_slot(source, target), images[source])
         conn.reboot("fastboot")
 
     with transport.connect("fastbootd") as (mode, conn):
@@ -456,13 +503,17 @@ def install_inactive(transport, images, *, probe=False, confirm_release=None):
             conn.flash(name, images[source])
             if partition_size(conn, name) != images[source].stat().st_size:
                 raise FlashError(f"{name} 分区写入后的容量与镜像不符。")
-        conn.erase("userdata")
-        conn.erase("metadata")
+        if keep_data:
+            print("同一构建平刷，保留 userdata 和 metadata。", flush=True)
+        else:
+            conn.erase("userdata")
+            conn.erase("metadata")
         conn.set_active(target)
         if conn.get("current-slot") != target:
             raise FlashError(f"fastbootd 未确认切换到 {target.upper()} 槽。请保留当前界面。")
         conn.reboot()
-    print(f"已切换到 {target.upper()} 槽并发送重启命令。请等待首次设置。", flush=True)
+    suffix = "请等待系统启动。" if keep_data else "请等待首次设置。"
+    print(f"已切换到 {target.upper()} 槽并发送重启命令。{suffix}", flush=True)
 
 
 def main():
@@ -470,11 +521,15 @@ def main():
     checks = parser.add_mutually_exclusive_group()
     checks.add_argument("--check", action="store_true", help="仅校验包内文件")
     checks.add_argument("--probe", action="store_true", help="校验文件和两种 fastboot 通道")
+    parser.add_argument("--verified-slot-firmware", "--verified-b-firmware", type=Path,
+                        help="本机目标槽已写入的原厂固件读回记录")
+    parser.add_argument("--keep-data", action="store_true", help="从已启动的同一构建执行双槽平刷，保留数据")
     args = parser.parse_args()
     try:
         if not (args.check or args.probe):
             print("若使用此自制固件，此手机的保修可能会失效。", flush=True)
-            print("刷入完成后将清除手机上的全部用户数据。请先备份。", flush=True)
+            print("本次从同一构建平刷并保留用户数据。" if args.keep_data
+                  else "刷入完成后将清除手机上的全部用户数据。请先备份。", flush=True)
             print("双槽包如遇空间不足，会先请你确认释放旧槽分区。", flush=True)
             try:
                 answer = input("确认要刷入吗？输入 yes 确认，输入其它内容则取消刷入。 ")
@@ -487,11 +542,19 @@ def main():
         if args.check:
             return 0
         transport = Transport(ROOT)
-        install(transport, images, probe=args.probe)
+        install_args = {"probe": args.probe}
+        if args.verified_slot_firmware is not None:
+            install_args["firmware_receipt"] = args.verified_slot_firmware
+        if args.keep_data:
+            install_args["keep_data"] = True
+        install(transport, images, **install_args)
         return 0
     except (FlashError, OSError, ValueError, subprocess.TimeoutExpired, KeyboardInterrupt) as error:
         print(f"流程已停止。{error}", file=sys.stderr, flush=True)
-        print("请保留当前界面。排除问题后，从 fastboot 或 fastbootd 重新运行同一刷机包。", file=sys.stderr)
+        if args.keep_data:
+            print("请保留当前界面和日志。核对分区状态后再继续保留数据的安装。", file=sys.stderr)
+        else:
+            print("请保留当前界面。排除问题后，从 fastboot 或 fastbootd 重新运行同一刷机包。", file=sys.stderr)
         return 1
 
 
