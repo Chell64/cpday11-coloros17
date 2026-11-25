@@ -12,8 +12,6 @@
 
 CPDAY11-ColorOS17-17.0.0.xxx-xx-fastboot-windows-x64
 
-刷入 ColorOS V1 前，请将双槽补丁解压到原镜像包目录。A 槽和 B 槽均可开始刷入。 [V1 刷入说明](https://github.com/Chell64/cpday11-coloros17/releases/tag/17.0.0.101-v1)
-
 需要恢复酷派原厂系统时，请使用 FirstAid-V3。 [系统急救包](https://github.com/Chell64/cpday11-coloros17/releases/tag/FirstAid-V3)
 
 ## 刷入前
