@@ -12,11 +12,13 @@
 
 CPDAY11-ColorOS17-17.0.0.xxx-xx-fastboot-windows-x64
 
-使用 V1 时，从发行页下载修订版 `Flash.cmd`，拖进解压目录最外层并选择替换，再按发行页的步骤刷入。 [V1 刷入说明](https://github.com/Chell64/cpday11-coloros17/releases/tag/17.0.0.101-v1)
+刷入 ColorOS V1 前，请将双槽补丁解压到原镜像包目录。A 槽和 B 槽均可开始刷入。 [V1 刷入说明](https://github.com/Chell64/cpday11-coloros17/releases/tag/17.0.0.101-v1)
+
+需要恢复酷派原厂系统时，请使用 FirstAid-V2。 [系统急救包](https://github.com/Chell64/cpday11-coloros17/releases/tag/FirstAid-V2)
 
 ## 刷入前
 
-刷机包适用于已解锁、当前处于 A 槽的 CPDAY11。刷入完成后会清除用户数据，请先备份。若使用此自制固件，此手机的保修可能会失效。
+刷机包适用于已解锁的 CPDAY11。刷入完成后会清除用户数据，请先备份。若使用此自制固件，此手机的保修可能会失效。
 
 ## 致谢
 
