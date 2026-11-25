@@ -1,0 +1,2 @@
+7fef30cd19d0dcc48ddc0d51b61a1111e7c6c06395c1722a6c4ade4bb9cecd1f  CPDAY11-FirstAid-V1-windows-x64.7z.001
+677620de8b003e4cf95fee82f1bcc84f2e89d43ce1887c45d5f9201fc33b00da  CPDAY11-FirstAid-V1-windows-x64.7z.002
