@@ -33,7 +33,7 @@ CPDAY11-ColorOS17-17.0.0.xxx-xx-fastboot-windows-x64
 转载或分发派生版本时，请随附许可全文或链接，并保留下方的项目署名。
 
 ```text
-Required Notice: COOL X Wide ColorOS 17 移植项目（https://github.com/Chell64/cpday11-coloros17）
+Required Notice: COOL X Wide ColorOS 17 移植项目（https://github.com/Chell64/cpday11-coloros17）。由项目持有人使用 先看评测 资源制作
 ```
 
 OPPO、酷派及其他第三方闭源组件的权利归各自权利人所有，使用和分发以各自的授权条款为准。随包分发的第三方开源组件及受其许可约束的改动继续遵循各自原许可。
